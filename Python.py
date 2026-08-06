@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Discord Selfbot - Production-grade implementation with real-device fingerprinting.
 API version: v10 [😭✌️]
