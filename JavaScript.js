@@ -1,32 +1,28 @@
-/**
- * Discord Selfbot - Production-grade implementation with real-device fingerprinting.
- * API version: v10 [😭✌️]
- */
+#!/usr/bin/env node
+// Discord selfbot - complete implementation with modern evasion.
+// Uses axios for REST and ws for WebSocket. Node's TLS fingerprint
+// is harder to spoof, but we keep the header and property structure
+// identical to the official client.
 
 const axios = require('axios');
 const WebSocket = require('ws');
 const crypto = require('crypto');
 
 class DiscordSelfbot {
-    /**
-     * Full-featured Discord selfbot with REST API and WebSocket gateway support.
-     */
     constructor(token) {
         this.token = token;
-        this.ws = null;
-        this.wsHeartbeat = null;
-        this.running = false;
-
+        // Build an axios instance with the correct base URL.
         this.client = axios.create({
             baseURL: 'https://discord.com/api/v10',
             timeout: 30000,
             headers: this._buildHeaders()
         });
+        this.ws = null;
+        this.wsHeartbeat = null;
+        this.running = false;
     }
 
-    /**
-     * Generate realistic device fingerprint matching official Discord client.
-     */
+    // Device properties – must match a real client.
     _deviceProperties() {
         return {
             os: 'Windows',
@@ -44,12 +40,22 @@ class DiscordSelfbot {
         };
     }
 
-    /**
-     * Construct full request headers with proper fingerprinting.
-     */
-    _buildHeaders() {
+    // Context properties – dynamic per request.
+    _contextProperties(location = 'Guild Sidebar', guildId = null, channelId = null) {
+        return {
+            location: location,
+            location_guild_id: guildId,
+            location_channel_id: channelId,
+            location_channel_type: 0
+        };
+    }
+
+    // Build the complete header set for a REST call.
+    _buildHeaders(endpoint = '', guildId = null, channelId = null) {
         const props = this._deviceProperties();
         const propsB64 = Buffer.from(JSON.stringify(props)).toString('base64');
+        const ctx = this._contextProperties(undefined, guildId, channelId);
+        const ctxB64 = Buffer.from(JSON.stringify(ctx)).toString('base64');
 
         return {
             'Authorization': this.token,
@@ -61,6 +67,7 @@ class DiscordSelfbot {
             'Origin': 'https://discord.com',
             'Referer': 'https://discord.com/channels/@me',
             'X-Super-Properties': propsB64,
+            'X-Context-Properties': ctxB64,
             'X-Discord-Locale': 'en-US',
             'X-Discord-Timezone': 'America/New_York',
             'Sec-Ch-Ua': '"Chromium";v="124", "Discord";v="1.0.9166"',
@@ -72,31 +79,21 @@ class DiscordSelfbot {
         };
     }
 
-    /**
-     * Execute API request with automatic retry and rate-limit handling.
-     * Discord uses a dual-layer architecture: REST API for state changes,
-     * WebSocket gateway for real-time events[reference:13].
-     */
-    async _request(method, endpoint, data = null) {
+    // Internal request with retry logic and rate‑limit handling.
+    async _request(method, endpoint, data = null, guildId = null, channelId = null) {
+        // Update headers for this specific request.
+        this.client.defaults.headers = this._buildHeaders(endpoint, guildId, channelId);
+
         for (let attempt = 0; attempt < 3; attempt++) {
             try {
-                const resp = await this.client.request({
-                    method,
-                    url: endpoint,
-                    data
-                });
-
-                // Rate limit: Discord returns 429 with retry_after[reference:14]
+                const resp = await this.client.request({ method, url: endpoint, data });
                 if (resp.status === 429) {
                     const retryAfter = resp.data.retry_after || 5;
                     await this._sleep((retryAfter + Math.random() * 1.5) * 1000);
                     continue;
                 }
-
                 return resp.data;
-
             } catch (err) {
-                // Server errors: exponential backoff with jitter[reference:15]
                 if (err.response?.status >= 500) {
                     await this._sleep((2 ** attempt + Math.random()) * 1000);
                     continue;
@@ -104,14 +101,16 @@ class DiscordSelfbot {
                 throw err;
             }
         }
-        throw new Error('Request failed after maximum retries');
+        throw new Error('Request failed after retries');
     }
 
     _sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    // ---- REST API: User Endpoints ----
+    // -----------------------------------------------------------------
+    // REST API – all user‑level endpoints
+    // -----------------------------------------------------------------
 
     async getUser() {
         return this._request('GET', '/users/@me');
@@ -132,11 +131,7 @@ class DiscordSelfbot {
     async setStatus(status = 'online', customText = null) {
         const payload = { status, since: 0, activities: [] };
         if (customText) {
-            payload.activities.push({
-                name: customText,
-                type: 0,
-                created_at: Date.now()
-            });
+            payload.activities.push({ name: customText, type: 0, created_at: Date.now() });
         }
         return this._request('PATCH', '/users/@me/settings', payload);
     }
@@ -146,13 +141,11 @@ class DiscordSelfbot {
     }
 
     async setNote(userId, note) {
-        await this._request('PUT', `/users/@me/notes/${userId}`, { note });
+        return this._request('PUT', `/users/@me/notes/${userId}`, { note });
     }
 
-    // ---- REST API: Channel & Message Endpoints ----
-
     async getChannel(channelId) {
-        return this._request('GET', `/channels/${channelId}`);
+        return this._request('GET', `/channels/${channelId}`, null, null, channelId);
     }
 
     async createDM(recipientId) {
@@ -160,131 +153,130 @@ class DiscordSelfbot {
     }
 
     async sendMessage(channelId, content) {
-        return this._request('POST', `/channels/${channelId}/messages`, {
-            content,
-            nonce: String(Date.now())
-        });
+        return this._request(
+            'POST',
+            `/channels/${channelId}/messages`,
+            { content, nonce: String(Date.now()) },
+            null,
+            channelId
+        );
     }
 
     async editMessage(channelId, messageId, content) {
-        return this._request('PATCH', `/channels/${channelId}/messages/${messageId}`, {
-            content
-        });
+        return this._request(
+            'PATCH',
+            `/channels/${channelId}/messages/${messageId}`,
+            { content },
+            null,
+            channelId
+        );
     }
 
     async deleteMessage(channelId, messageId) {
-        await this._request('DELETE', `/channels/${channelId}/messages/${messageId}`);
+        await this._request('DELETE', `/channels/${channelId}/messages/${messageId}`, null, null, channelId);
     }
 
     async getMessages(channelId, limit = 50) {
-        return this._request('GET', `/channels/${channelId}/messages?limit=${limit}`);
+        return this._request('GET', `/channels/${channelId}/messages?limit=${limit}`, null, null, channelId);
     }
 
     async addReaction(channelId, messageId, emoji) {
         await this._request(
             'PUT',
-            `/channels/${channelId}/messages/${messageId}/reactions/${emoji}/@me`
+            `/channels/${channelId}/messages/${messageId}/reactions/${emoji}/@me`,
+            null,
+            null,
+            channelId
         );
     }
 
     async removeReaction(channelId, messageId, emoji) {
         await this._request(
             'DELETE',
-            `/channels/${channelId}/messages/${messageId}/reactions/${emoji}/@me`
+            `/channels/${channelId}/messages/${messageId}/reactions/${emoji}/@me`,
+            null,
+            null,
+            channelId
         );
     }
-
-    // ---- REST API: Guild Endpoints ----
 
     async joinGuild(inviteCode) {
         return this._request('POST', `/invites/${inviteCode}`);
     }
 
     async leaveGuild(guildId) {
-        await this._request('DELETE', `/users/@me/guilds/${guildId}`);
+        await this._request('DELETE', `/users/@me/guilds/${guildId}`, null, guildId);
     }
 
     async getGuildMembers(guildId, limit = 1000) {
-        return this._request('GET', `/guilds/${guildId}/members?limit=${limit}`);
+        return this._request('GET', `/guilds/${guildId}/members?limit=${limit}`, null, guildId);
     }
 
     async getGuildChannels(guildId) {
-        return this._request('GET', `/guilds/${guildId}/channels`);
+        return this._request('GET', `/guilds/${guildId}/channels`, null, guildId);
     }
 
-    // ---- WebSocket Gateway ----
+    // -----------------------------------------------------------------
+    // WebSocket gateway
+    // -----------------------------------------------------------------
 
-    /**
-     * Establish WebSocket connection to Discord's gateway.
-     * The gateway uses an opcode-based communication system for
-     * real-time events[reference:16].
-     */
     async connectGateway() {
-        const gatewayData = await this._request('GET', '/gateway');
-        const gatewayUrl = gatewayData.url;
+        const gateway = await this._request('GET', '/gateway');
+        const url = gateway.url;
 
         this.running = true;
-        this.ws = new WebSocket(`${gatewayUrl}/?v=10&encoding=json`);
+        this.ws = new WebSocket(`${url}/?v=10&encoding=json`);
 
         this.ws.on('open', () => {
-            const identifyPayload = {
+            // IDENTIFY payload – must match the REST properties.
+            const identify = {
                 op: 2,
                 d: {
                     token: this.token,
                     properties: this._deviceProperties(),
-                    presence: {
-                        status: 'online',
-                        since: 0,
-                        activities: [],
-                        afk: false
-                    },
+                    presence: { status: 'online', since: 0, activities: [], afk: false },
                     compress: false,
-                    large_threshold: 250
+                    large_threshold: 250,
+                    client_state: { guild_versions: {}, highest_last_message_id: '0' }
                 }
             };
-            this.ws.send(JSON.stringify(identifyPayload));
+            this.ws.send(JSON.stringify(identify));
         });
 
         this.ws.on('message', (data) => {
             try {
-                const payload = JSON.parse(data);
-                const op = payload.op;
-                const t = payload.t;
+                const msg = JSON.parse(data);
+                const op = msg.op;
+                const t = msg.t;
 
-                if (op === 10) { // Hello - contains heartbeat interval
-                    const interval = payload.d.heartbeat_interval;
+                if (op === 10) {
+                    const interval = msg.d.heartbeat_interval;
                     this._startHeartbeat(interval);
-                } else if (op === 11) { // Heartbeat ACK
-                    // Acknowledgment received
+                } else if (op === 11) {
+                    // Heartbeat ACK – do nothing
                 } else if (t === 'MESSAGE_CREATE') {
-                    const msg = payload.d;
-                    console.log(`[${msg.author.username}]: ${msg.content}`);
+                    const m = msg.d;
+                    console.log(`[${m.author.username}]: ${m.content}`);
                 } else if (t === 'READY') {
-                    console.log(`WebSocket ready. Logged in as ${payload.d.user.username}`);
+                    console.log(`Gateway ready: ${msg.d.user.username}`);
                 }
-            } catch (e) {
-                // Ignore parse errors
+            } catch (_) {
+                // Ignore malformed messages
             }
         });
 
-        this.ws.on('error', (err) => {
-            console.error('WebSocket error:', err.message);
-        });
-
+        this.ws.on('error', (err) => console.error('WebSocket error:', err.message));
         this.ws.on('close', () => {
             this.running = false;
             if (this.wsHeartbeat) {
                 clearInterval(this.wsHeartbeat);
                 this.wsHeartbeat = null;
             }
-            console.log('WebSocket disconnected');
         });
     }
 
     _startHeartbeat(interval) {
-        if (this.wsHeartbeat) {
-            clearInterval(this.wsHeartbeat);
-        }
+        if (this.wsHeartbeat) clearInterval(this.wsHeartbeat);
         this.wsHeartbeat = setInterval(() => {
             if (this.ws && this.ws.readyState === WebSocket.OPEN) {
                 this.ws.send(JSON.stringify({ op: 1, d: null }));
@@ -298,33 +290,25 @@ class DiscordSelfbot {
             clearInterval(this.wsHeartbeat);
             this.wsHeartbeat = null;
         }
-        if (this.ws) {
-            this.ws.close();
-        }
+        if (this.ws) this.ws.close();
     }
 }
 
-// ---- Usage Example ----
-
+// -------------------------------------------------------------------
+// Example usage
+// -------------------------------------------------------------------
 (async () => {
-    const TOKEN = 'YOUR_USER_TOKEN_HERE';
-
+    const TOKEN = 'YOUR_USER_TOKEN';
     const bot = new DiscordSelfbot(TOKEN);
 
-    // Test REST API
     const user = await bot.getUser();
-    console.log(`Logged in as: ${user.username}#${user.discriminator || '0'}`);
+    console.log(`Logged in: ${user.username}#${user.discriminator || '0'}`);
 
-    // Set presence
-    await bot.setStatus('online', 'Custom Status');
-
-    // Connect to gateway for real-time events
+    await bot.setStatus('online', 'Custom status');
     await bot.connectGateway();
 
-    // Keep running
     process.on('SIGINT', () => {
         bot.disconnectGateway();
-        console.log('Disconnected');
         process.exit(0);
     });
 })();
