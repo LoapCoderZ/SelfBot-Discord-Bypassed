@@ -1,32 +1,41 @@
-"""
-Discord Selfbot - Production-grade implementation with real-device fingerprinting.
-API version: v10 [😭✌️]
-"""
+#!/usr/bin/env python3
+# Discord selfbot - production implementation with modern evasion
+# Uses tls-client for TLS fingerprint spoofing (Chrome 124) and
+# full WebSocket gateway support. Works on Linux/Windows.
 
-import requests
 import json
 import base64
 import time
 import random
 import secrets
-import websocket
 import threading
-from typing import Optional, Dict, Any, List
+import tls_client
+import websocket
 
+# -------------------------------------------------------------------
+# The core class. Handles REST API and WebSocket gateway.
+# All headers and properties match a real Discord desktop client.
+# -------------------------------------------------------------------
 
 class DiscordSelfbot:
-    """Full-featured Discord selfbot with REST API and WebSocket gateway support."""
-
     def __init__(self, token: str):
         self.token = token
-        self.session = requests.Session()
-        self.session.headers.update(self._build_headers())
+        # TLS session mimics Chrome 124 – this avoids the obvious
+        # fingerprint that normal requests or urllib3 leave behind.
+        self.session = tls_client.Session(
+            client_identifier="chrome_124",
+            random_tls_extension_order=True
+        )
         self.ws = None
         self.ws_thread = None
         self.running = False
 
-    def _device_properties(self) -> Dict[str, Any]:
-        """Generate realistic device fingerprint matching official Discord client."""
+    # -----------------------------------------------------------------
+    # Device properties – the X-Super-Properties header.
+    # The launch_signature must be random per request to avoid
+    # static fingerprinting. has_client_mods must be false.
+    # -----------------------------------------------------------------
+    def _device_properties(self):
         return {
             "os": "Windows",
             "os_version": "10.0.19045",
@@ -42,12 +51,22 @@ class DiscordSelfbot:
             "client_launch_id": secrets.token_hex(16)
         }
 
-    def _build_headers(self) -> Dict[str, str]:
-        """Construct full request headers with proper fingerprinting."""
+    # X-Context-Properties – tells Discord where the request comes from.
+    # We set location to 'Guild Sidebar' by default; can be overridden.
+    def _context_properties(self, location="Guild Sidebar", guild_id=None, channel_id=None):
+        return {
+            "location": location,
+            "location_guild_id": guild_id,
+            "location_channel_id": channel_id,
+            "location_channel_type": 0
+        }
+
+    # Build full headers for a given endpoint.
+    def _headers(self, endpoint: str, guild_id=None, channel_id=None):
         props = self._device_properties()
-        props_b64 = base64.b64encode(
-            json.dumps(props, separators=(",", ":")).encode()
-        ).decode()
+        props_b64 = base64.b64encode(json.dumps(props).encode()).decode()
+        ctx = self._context_properties(guild_id=guild_id, channel_id=channel_id)
+        ctx_b64 = base64.b64encode(json.dumps(ctx).encode()).decode()
 
         return {
             "Authorization": self.token,
@@ -63,6 +82,7 @@ class DiscordSelfbot:
             "Origin": "https://discord.com",
             "Referer": "https://discord.com/channels/@me",
             "X-Super-Properties": props_b64,
+            "X-Context-Properties": ctx_b64,
             "X-Discord-Locale": "en-US",
             "X-Discord-Timezone": "America/New_York",
             "Sec-Ch-Ua": '"Chromium";v="124", "Discord";v="1.0.9166"',
@@ -73,62 +93,41 @@ class DiscordSelfbot:
             "Sec-Fetch-Site": "same-origin"
         }
 
-    def _request(self, method: str, endpoint: str, data: Optional[Dict] = None) -> Any:
-        """
-        Execute API request with automatic retry and rate-limit handling.
-        Discord uses a dual-layer architecture: REST API for state changes,
-        WebSocket gateway for real-time events[reference:9].
-        """
+    # Internal request handler with retry and rate‑limit backoff.
+    def _request(self, method: str, endpoint: str, data=None, guild_id=None, channel_id=None):
         url = f"https://discord.com/api/v10{endpoint}"
+        headers = self._headers(endpoint, guild_id, channel_id)
 
         for attempt in range(3):
-            try:
-                resp = self.session.request(method, url, json=data, timeout=30)
-
-                # Rate limit: Discord returns 429 with retry_after[reference:10]
-                if resp.status_code == 429:
-                    retry_after = resp.json().get("retry_after", 5)
-                    time.sleep(retry_after + random.uniform(0.5, 1.5))
-                    continue
-
-                # Server errors: exponential backoff with jitter[reference:11]
-                if resp.status_code >= 500:
-                    time.sleep((2 ** attempt) + random.uniform(0, 1))
-                    continue
-
-                resp.raise_for_status()
-                return resp.json() if resp.text else None
-
-            except requests.exceptions.RequestException:
-                if attempt == 2:
-                    raise
+            resp = self.session.request(method, url, headers=headers, json=data)
+            if resp.status_code == 429:
+                retry_after = resp.json().get("retry_after", 5)
+                time.sleep(retry_after + random.uniform(0.5, 1.5))
+                continue
+            if resp.status_code >= 500:
                 time.sleep((2 ** attempt) + random.uniform(0, 1))
+                continue
+            resp.raise_for_status()
+            return resp.json() if resp.text else None
+        raise RuntimeError("Request failed after retries")
 
-        raise RuntimeError("Request failed after maximum retries")
+    # -----------------------------------------------------------------
+    # REST API – full coverage of user‑level endpoints.
+    # -----------------------------------------------------------------
 
-    # ---- REST API: User Endpoints ----
-
-    def get_user(self) -> Dict:
-        """Fetch authenticated user information."""
+    def get_user(self):
         return self._request("GET", "/users/@me")
 
-    def get_guilds(self) -> List[Dict]:
-        """List all guilds the user is a member of."""
+    def get_guilds(self):
         return self._request("GET", "/users/@me/guilds")
 
-    def get_relationships(self) -> List[Dict]:
-        """Fetch user's friend list and relationship statuses."""
+    def get_relationships(self):
         return self._request("GET", "/users/@me/relationships")
 
-    def get_settings(self) -> Dict:
-        """Retrieve current user settings."""
+    def get_settings(self):
         return self._request("GET", "/users/@me/settings")
 
-    def set_status(self, status: str = "online", custom_text: Optional[str] = None) -> Dict:
-        """
-        Update presence status.
-        Status options: online, idle, dnd, invisible
-        """
+    def set_status(self, status="online", custom_text=None):
         payload = {"status": status, "since": 0, "activities": []}
         if custom_text:
             payload["activities"].append({
@@ -138,191 +137,149 @@ class DiscordSelfbot:
             })
         return self._request("PATCH", "/users/@me/settings", payload)
 
-    def get_notes(self, user_id: str) -> Dict:
-        """Fetch note for a specific user."""
+    def get_note(self, user_id):
         return self._request("GET", f"/users/@me/notes/{user_id}")
 
-    def set_note(self, user_id: str, note: str) -> None:
-        """Set or update a note for a user."""
-        self._request("PUT", f"/users/@me/notes/{user_id}", {"note": note})
+    def set_note(self, user_id, note):
+        return self._request("PUT", f"/users/@me/notes/{user_id}", {"note": note})
 
-    # ---- REST API: Channel & Message Endpoints ----
+    # Channels & messages
+    def get_channel(self, channel_id):
+        return self._request("GET", f"/channels/{channel_id}", channel_id=channel_id)
 
-    def get_channel(self, channel_id: str) -> Dict:
-        """Fetch channel information."""
-        return self._request("GET", f"/channels/{channel_id}")
-
-    def create_dm(self, recipient_id: str) -> Dict:
-        """Create a direct message channel with another user."""
+    def create_dm(self, recipient_id):
         return self._request("POST", "/users/@me/channels", {"recipient_id": recipient_id})
 
-    def send_message(self, channel_id: str, content: str) -> Dict:
-        """Send a message to a channel."""
+    def send_message(self, channel_id, content):
         return self._request(
             "POST",
             f"/channels/{channel_id}/messages",
-            {"content": content, "nonce": str(int(time.time() * 1000))}
+            {"content": content, "nonce": str(int(time.time() * 1000))},
+            channel_id=channel_id
         )
 
-    def edit_message(self, channel_id: str, message_id: str, content: str) -> Dict:
-        """Edit an existing message."""
+    def edit_message(self, channel_id, message_id, content):
         return self._request(
             "PATCH",
             f"/channels/{channel_id}/messages/{message_id}",
-            {"content": content}
+            {"content": content},
+            channel_id=channel_id
         )
 
-    def delete_message(self, channel_id: str, message_id: str) -> None:
-        """Delete a message."""
-        self._request("DELETE", f"/channels/{channel_id}/messages/{message_id}")
+    def delete_message(self, channel_id, message_id):
+        self._request("DELETE", f"/channels/{channel_id}/messages/{message_id}", channel_id=channel_id)
 
-    def get_messages(self, channel_id: str, limit: int = 50) -> List[Dict]:
-        """Fetch recent messages from a channel."""
-        return self._request("GET", f"/channels/{channel_id}/messages?limit={limit}")
+    def get_messages(self, channel_id, limit=50):
+        return self._request("GET", f"/channels/{channel_id}/messages?limit={limit}", channel_id=channel_id)
 
-    def add_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
-        """Add a reaction to a message."""
+    def add_reaction(self, channel_id, message_id, emoji):
         self._request(
             "PUT",
-            f"/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me"
+            f"/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me",
+            channel_id=channel_id
         )
 
-    def remove_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
-        """Remove a reaction from a message."""
+    def remove_reaction(self, channel_id, message_id, emoji):
         self._request(
             "DELETE",
-            f"/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me"
+            f"/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me",
+            channel_id=channel_id
         )
 
-    # ---- REST API: Guild Endpoints ----
-
-    def join_guild(self, invite_code: str) -> Dict:
-        """Join a guild using an invite code."""
+    # Guild management
+    def join_guild(self, invite_code):
         return self._request("POST", f"/invites/{invite_code}")
 
-    def leave_guild(self, guild_id: str) -> None:
-        """Leave a guild."""
-        self._request("DELETE", f"/users/@me/guilds/{guild_id}")
+    def leave_guild(self, guild_id):
+        self._request("DELETE", f"/users/@me/guilds/{guild_id}", guild_id=guild_id)
 
-    def get_guild_members(self, guild_id: str, limit: int = 1000) -> List[Dict]:
-        """Fetch members of a guild."""
-        return self._request("GET", f"/guilds/{guild_id}/members?limit={limit}")
+    def get_guild_members(self, guild_id, limit=1000):
+        return self._request("GET", f"/guilds/{guild_id}/members?limit={limit}", guild_id=guild_id)
 
-    def get_guild_channels(self, guild_id: str) -> List[Dict]:
-        """Fetch all channels in a guild."""
-        return self._request("GET", f"/guilds/{guild_id}/channels")
+    def get_guild_channels(self, guild_id):
+        return self._request("GET", f"/guilds/{guild_id}/channels", guild_id=guild_id)
 
-    # ---- WebSocket Gateway ----
+    # -----------------------------------------------------------------
+    # WebSocket gateway – real‑time events with proper IDENTIFY.
+    # -----------------------------------------------------------------
+
+    def _on_open(self, ws):
+        # The IDENTIFY payload must match the REST fingerprint exactly.
+        identify = {
+            "op": 2,
+            "d": {
+                "token": self.token,
+                "properties": self._device_properties(),
+                "presence": {"status": "online", "since": 0, "activities": [], "afk": False},
+                "compress": False,
+                "large_threshold": 250,
+                "client_state": {"guild_versions": {}, "highest_last_message_id": "0"}
+            }
+        }
+        ws.send(json.dumps(identify))
 
     def _on_message(self, ws, message):
-        """Handle incoming WebSocket messages."""
         try:
             data = json.loads(message)
             op = data.get("op")
             t = data.get("t")
 
-            if op == 10:  # Hello - contains heartbeat interval
-                heartbeat_interval = data["d"]["heartbeat_interval"]
-                self._heartbeat_thread(ws, heartbeat_interval)
-
-            elif op == 11:  # Heartbeat ACK
-                pass  # Acknowledgment received
-
+            if op == 10:   # Hello – start heartbeat
+                interval = data["d"]["heartbeat_interval"]
+                self._heartbeat_loop(ws, interval)
+            elif op == 11:
+                pass   # ACK, ignore
             elif t == "MESSAGE_CREATE":
                 msg = data["d"]
                 print(f"[{msg['author']['username']}]: {msg['content']}")
-
             elif t == "READY":
-                print(f"WebSocket ready. Logged in as {data['d']['user']['username']}")
-
-        except json.JSONDecodeError:
+                print(f"Gateway ready: {data['d']['user']['username']}")
+        except:
             pass
 
-    def _on_error(self, ws, error):
-        print(f"WebSocket error: {error}")
-
-    def _on_close(self, ws, close_status_code, close_msg):
-        self.running = False
-        print("WebSocket disconnected")
-
-    def _on_open(self, ws):
-        """Send IDENTIFY payload on connection open."""
-        identify_payload = {
-            "op": 2,
-            "d": {
-                "token": self.token,
-                "properties": self._device_properties(),
-                "presence": {
-                    "status": "online",
-                    "since": 0,
-                    "activities": [],
-                    "afk": False
-                },
-                "compress": False,
-                "large_threshold": 250
-            }
-        }
-        ws.send(json.dumps(identify_payload))
-
-    def _heartbeat_thread(self, ws, interval):
-        """Maintain WebSocket connection with periodic heartbeats."""
-        import time
-        while self.running:
-            time.sleep(interval / 1000)
-            if self.running:
-                ws.send(json.dumps({"op": 1, "d": None}))
+    def _heartbeat_loop(self, ws, interval):
+        # Heartbeat in a separate thread to keep connection alive.
+        def beat():
+            while self.running:
+                time.sleep(interval / 1000)
+                if self.running:
+                    ws.send(json.dumps({"op": 1, "d": None}))
+        threading.Thread(target=beat, daemon=True).start()
 
     def connect_gateway(self):
-        """
-        Establish WebSocket connection to Discord's gateway.
-        The gateway uses an opcode-based communication system for
-        real-time events[reference:12].
-        """
-        # Fetch gateway URL
-        gateway_data = self._request("GET", "/gateway")
-        gateway_url = gateway_data["url"]
-
+        gateway = self._request("GET", "/gateway")["url"]
         self.running = True
         self.ws = websocket.WebSocketApp(
-            f"{gateway_url}/?v=10&encoding=json",
+            f"{gateway}/?v=10&encoding=json",
             on_open=self._on_open,
             on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close
+            on_error=lambda ws, e: print("WS error:", e),
+            on_close=lambda ws, code, msg: setattr(self, "running", False)
         )
-
-        self.ws_thread = threading.Thread(target=self.ws.run_forever)
-        self.ws_thread.daemon = True
+        self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
         self.ws_thread.start()
 
     def disconnect_gateway(self):
-        """Close WebSocket connection gracefully."""
         self.running = False
         if self.ws:
             self.ws.close()
 
 
-# ---- Usage Example ----
-
+# -------------------------------------------------------------------
+# Example usage
+# -------------------------------------------------------------------
 if __name__ == "__main__":
-    TOKEN = "YOUR_USER_TOKEN_HERE"
+    TOKEN = "YOUR_USER_TOKEN"
 
     bot = DiscordSelfbot(TOKEN)
-
-    # Test REST API
     user = bot.get_user()
-    print(f"Logged in as: {user['username']}#{user.get('discriminator', '0')}")
+    print(f"Logged in: {user['username']}#{user.get('discriminator', '0')}")
 
-    # Set presence
-    bot.set_status("online", "Custom Status")
-
-    # Connect to gateway for real-time events
+    bot.set_status("online", "Custom presence")
     bot.connect_gateway()
 
-    # Keep running
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         bot.disconnect_gateway()
-        print("Disconnected")
