@@ -1,6 +1,6 @@
 /**
  * Discord Selfbot - Production-grade implementation with real-device fingerprinting.
- * API version: v10
+ * API version: v10 [😭✌️]
  */
 
 const axios = require('axios');
